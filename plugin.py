@@ -304,7 +304,7 @@ class BasePlugin:
 
             if all_producing and not self.notif_all_started:
                 self.send_notification("🔆 All inverters are now producing!")
-                Devices[2].Update(nValue=0, sValue="On")
+                Devices[2].Update(nValue=1, sValue="On")
                 self.notif_all_started = True
                 self.notif_all_stopped = False
                 self.daily_report_sent = False # Reset for the day
