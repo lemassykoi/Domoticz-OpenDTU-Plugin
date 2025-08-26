@@ -134,7 +134,7 @@ class BasePlugin:
                 # Create a Domoticz device for this inverter if it doesn't exist
                 if unit_id_counter not in Devices:
                     Domoticz.Log(f"Creating device for inverter '{name}' with Unit={unit_id_counter}, DeviceID='{serial}'")
-                    Domoticz.Device(Name=name, Unit=unit_id_counter, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=str(serial), Used=1).Create()
+                    Domoticz.Device(Name=name, Unit=unit_id_counter, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=str(serial), Used=1, Options={'EnergyMeterMode': '1' }).Create()
                     created_devices.append(unit_id_counter)
                     Domoticz.Debug(f"Device created with keys: {list(Devices.keys())}")
                 else:
@@ -144,7 +144,7 @@ class BasePlugin:
             # Create a global device for total production if it doesn't exist
             if 1 not in Devices:
                 Domoticz.Log(f"Creating global device with Unit=1, DeviceID='{GLOBAL_DEVICE_ID}'")
-                Domoticz.Device(Name=GLOBAL_DEVICE_NAME, Unit=1, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=GLOBAL_DEVICE_ID, Used=1).Create()
+                Domoticz.Device(Name=GLOBAL_DEVICE_NAME, Unit=1, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=GLOBAL_DEVICE_ID, Used=1, Options={'EnergyMeterMode': '1' }).Create()
                 created_devices.append(1)
                 Domoticz.Debug(f"Global device created, available devices: {list(Devices.keys())}")
             else:
