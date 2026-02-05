@@ -1,6 +1,6 @@
 # Domoticz OpenDTU Plugin
 
-A Domoticz plugin that collects solar production data from an OpenDTU unit without requiring MQTT. The plugin automatically discovers inverters and creates corresponding devices in Domoticz with smart notifications and room plan organization.
+A Domoticz plugin that collects solar production data from an OpenDTU unit via WebSocket for near-realtime updates. The plugin automatically discovers inverters and creates corresponding devices in Domoticz with smart notifications and room plan organization.
 
 ![Domoticz Logo](https://cdn.brandfetch.io/idT9Rk1_Fn/w/196/h/196/theme/light/logo.png?c=1bxid64Mup7aczewSAYMX&t=1748444255713) ![OpenDTU Logo](https://www.opendtu.solar/assets/images/logo.png)
 
@@ -12,13 +12,13 @@ A Domoticz plugin that collects solar production data from an OpenDTU unit witho
 - **📱 Smart Notifications**: Configurable notifications for production start/stop events (Telegram support)
 - **📈 Daily Reports**: Automatic daily summary reports at end of production day
 - **🏠 Room Plan Integration**: Automatically organizes all solar devices into a configurable room plan
-- **⚡ Real-time Updates**: Live data polling with configurable intervals
-- **🚫 No MQTT Required**: Direct HTTP API communication with OpenDTU
+- **⚡ WebSocket Streaming**: Near-realtime data pushed by OpenDTU (~11s cycle), no polling needed
+- **🚫 No MQTT Required**: Direct WebSocket connection to OpenDTU
 
 ## Requirements
 
 - **Domoticz** 2020.2 or later
-- **OpenDTU** device accessible via HTTP
+- **OpenDTU** device accessible via HTTP/WebSocket
 - **Python 3.9+** with requests library
 - Network connectivity between Domoticz and OpenDTU
 
@@ -46,7 +46,6 @@ A Domoticz plugin that collects solar production data from an OpenDTU unit witho
 | **OpenDTU IP Address** | IP address of your OpenDTU device | `192.168.1.100` | `192.168.1.50` |
 | **OpenDTU Username** | Username for OpenDTU web interface | `admin` | `admin` |
 | **OpenDTU Password** | Password for OpenDTU web interface | - | `your_password` |
-| **Polling Interval** | Data polling frequency in seconds | `10` | `30` |
 
 ### Optional Parameters
 
@@ -70,6 +69,15 @@ The plugin automatically creates the following devices:
 
 All devices are automatically organized into the specified room plan for better dashboard organization.
 
+## How It Works
+
+The plugin uses two communication methods:
+
+1. **Startup (HTTP)**: A one-time authenticated HTTP call to `/api/inverter/list` discovers all inverters and creates Domoticz devices.
+2. **Runtime (WebSocket)**: A persistent WebSocket connection to `ws://<address>/livedata` receives live data pushed by OpenDTU. Each cycle (~11 seconds), OpenDTU sends one frame per inverter containing full AC/DC details and totals.
+
+The WebSocket connection is automatically maintained with ping/pong keepalive and reconnects with backoff if disconnected.
+
 ## Notifications
 
 When configured with a notifier (Telegram), the plugin sends:
@@ -85,14 +93,6 @@ When configured with a notifier (Telegram), the plugin sends:
 - **Daily Reports**:
   - 🌞 Production Solaire du Jour : X.XXX kWh
 
-## API Endpoints Used
-
-The plugin communicates with these OpenDTU API endpoints:
-
-- `/api/inverter/list` - Inverter discovery (requires authentication)
-- `/api/livedata/status` - Live production data
-- `/api/livedata/status?inv=[serial]` - Individual inverter details
-
 ## Troubleshooting
 
 ### Common Issues
@@ -104,7 +104,7 @@ The plugin communicates with these OpenDTU API endpoints:
 
 **No data updates:**
 - Check network connectivity between Domoticz and OpenDTU
-- Verify polling interval is reasonable (minimum 10 seconds recommended)
+- Look for "WebSocket connection established" in the logs to confirm the connection
 - Check Domoticz logs for error messages
 
 **Notifications not working:**
@@ -118,7 +118,7 @@ Enable debug logging by setting **Debug Level** to:
 - **True**: Full debug output
 - **Plugin Only**: Plugin-specific debug messages only
 
-Debug logs will appear in the Domoticz log with detailed API communication and data processing information.
+Debug logs will appear in the Domoticz log with detailed WebSocket and data processing information.
 
 ## OpenDTU Compatibility
 
