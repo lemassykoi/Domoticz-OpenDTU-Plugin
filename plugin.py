@@ -3,7 +3,7 @@
 # Author: lemassykoi
 #
 """
-<plugin key="OpenDTU" name="OpenDTU Data Collector" author="lemassykoi" version="0.6.0" wikilink="https://github.com/lemassykoi/Domoticz-OpenDTU-Plugin" externallink="https://github.com/openDTU/openDTU">
+<plugin key="OpenDTU" name="OpenDTU Data Collector" author="lemassykoi" version="0.7.0" externallink="https://github.com/lemassykoi/Domoticz-OpenDTU-Plugin">
     <description>
         <h2>OpenDTU Data Collector</h2><br/>
         Collects solar data from an OpenDTU unit via WebSocket. The plugin automatically discovers inverters and creates corresponding devices in Domoticz.
@@ -66,8 +66,8 @@ import urllib.parse
 import time
 
 GLOBAL_DEVICE_ID = "OpenDTU_Global"
-GLOBAL_DEVICE_NAME = "Solar Production Counter"
-PROD_SWITCH_NAME = "Production Solaire"
+GLOBAL_DEVICE_NAME = "Solar Counter"
+PROD_SWITCH_NAME = "Solar Production"
 
 
 class BasePlugin:
@@ -79,6 +79,8 @@ class BasePlugin:
         self.daily_report_sent = True
         self.reconAgain = 3
         self.last_global_svalue = ""
+        self.last_total_yield = 0
+        self.yield_offset = 0
         return
 
     def onStart(self):
@@ -134,6 +136,16 @@ class BasePlugin:
             Domoticz.Error(f"Could not connect to OpenDTU at '{Parameters['Address']}'. Check IP, credentials, and network. Error: {e}")
         except Exception as e:
             Domoticz.Error(f"An unexpected error occurred during onStart: {e}")
+
+        # --- Restore last known total yield from existing device ---
+        if 1 in Devices and Devices[1].sValue:
+            try:
+                parts = Devices[1].sValue.split(";")
+                if len(parts) >= 2:
+                    self.last_total_yield = int(float(parts[1]))
+                    Domoticz.Log(f"Restored last total yield from device: {self.last_total_yield} Wh")
+            except (ValueError, IndexError):
+                pass
 
         # --- Connect WebSocket ---
         self.connectWebSocket()
@@ -201,8 +213,16 @@ class BasePlugin:
         # --- Update Global Device (only if value changed) ---
         if 'total' in live_data and 1 in Devices:
             total_power = float(live_data['total']['Power']['v'])
-            total_yield_lifetime = int(float(live_data['total']['YieldTotal']['v']) * 1000)
-            sValue = f"{total_power};{total_yield_lifetime}"
+            raw_yield = int(float(live_data['total']['YieldTotal']['v']) * 1000)
+
+            if raw_yield < self.last_total_yield:
+                self.yield_offset += self.last_total_yield
+                Domoticz.Log(f"OpenDTU yield counter reset detected (was {self.last_total_yield} Wh, now {raw_yield} Wh). Adjusting offset to {self.yield_offset} Wh.")
+
+            self.last_total_yield = raw_yield
+            adjusted_yield = self.yield_offset + raw_yield
+
+            sValue = f"{total_power};{adjusted_yield}"
             if sValue != self.last_global_svalue:
                 Devices[1].Update(nValue=0, sValue=sValue)
                 self.last_global_svalue = sValue
