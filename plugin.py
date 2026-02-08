@@ -47,11 +47,11 @@
             </options>
         </param>
         <param field="Mode4" label="Room Plan Name" width="200px" required="false" default="Solar"/>
-        <param field="Mode6" label="Debug" width="75px">
+        <param field="Mode6" label="Debug" width="150px">
             <options>
-                <option label="True" value="1"/>
-                <option label="False" value="0" default="true" />
-                <option label="Plugin Only" value="2"/>
+                <option label="None" value="0" default="true"/>
+                <option label="Plugin Debug" value="2"/>
+                <option label="All" value="1"/>
             </options>
         </param>
     </params>
