@@ -69,6 +69,17 @@ GLOBAL_DEVICE_ID = "OpenDTU_Global"
 GLOBAL_DEVICE_NAME = "Solar Counter"
 PROD_SWITCH_NAME = "Solar Production"
 
+_domoticz_port = None
+
+
+def get_domoticz_http_port():
+    with open("/proc/self/cmdline", "rb") as f:
+        args = [a.decode() for a in f.read().split(b'\x00') if a]
+    for i, arg in enumerate(args):
+        if arg == "-www" and i + 1 < len(args):
+            return int(args[i + 1])
+    return None
+
 
 class BasePlugin:
     def __init__(self):
@@ -84,17 +95,25 @@ class BasePlugin:
         return
 
     def onStart(self):
+        global _domoticz_port
         Domoticz.Log("onStart called")
 
         if Parameters["Mode6"] != "0":
             Domoticz.Debugging(int(Parameters["Mode6"]))
             DumpConfigToLog()
 
+        domoticz_http_port = get_domoticz_http_port()
+        if domoticz_http_port is not None:
+            Domoticz.Log(f"Domoticz detected HTTP Port: {domoticz_http_port}")
+            _domoticz_port = domoticz_http_port
+        else:
+            Domoticz.Error("Failed to detect Domoticz HTTP Port")
+
         # --- Device Discovery and Creation (one-time HTTP call) ---
         dtu_auth_url = f"http://{Parameters['Username']}:{Parameters['Password']}@{Parameters['Address']}"
         try:
             room_plan_name = Parameters.get("Mode4", "Solar").strip() or "Solar"
-            solar_plan_idx = get_room_plan_idx(room_plan_name)
+            solar_plan_idx = get_room_plan_idx(room_plan_name) if _domoticz_port else None
 
             inverters_list_response = requests.get(f'{dtu_auth_url}/api/inverter/list', timeout=5)
             inverters_list_response.raise_for_status()
@@ -215,14 +234,16 @@ class BasePlugin:
             total_power = float(live_data['total']['Power']['v'])
             raw_yield = int(float(live_data['total']['YieldTotal']['v']) * 1000)
 
-            if raw_yield < self.last_total_yield:
-                self.yield_offset += self.last_total_yield
-                Domoticz.Log(f"OpenDTU yield counter reset detected (was {self.last_total_yield} Wh, now {raw_yield} Wh). Adjusting offset to {self.yield_offset} Wh.")
+            if raw_yield == 0:
+                Domoticz.Debug("Ignoring YieldTotal of 0 (inverter likely unreachable)")
+                sValue = f"{total_power};{self.yield_offset + self.last_total_yield}"
+            else:
+                if raw_yield < self.last_total_yield:
+                    self.yield_offset += self.last_total_yield
+                    Domoticz.Log(f"OpenDTU yield counter reset detected (was {self.last_total_yield} Wh, now {raw_yield} Wh). Adjusting offset to {self.yield_offset} Wh.")
+                self.last_total_yield = raw_yield
+                sValue = f"{total_power};{self.yield_offset + raw_yield}"
 
-            self.last_total_yield = raw_yield
-            adjusted_yield = self.yield_offset + raw_yield
-
-            sValue = f"{total_power};{adjusted_yield}"
             if sValue != self.last_global_svalue:
                 Devices[1].Update(nValue=0, sValue=sValue)
                 self.last_global_svalue = sValue
@@ -287,13 +308,13 @@ class BasePlugin:
 
     def send_notification(self, message):
         notifier = Parameters["Mode2"]
-        if notifier:
+        if notifier and _domoticz_port:
             Domoticz.Log(f"Sending notification: '{message}' via '{notifier}'")
             try:
                 subject = urllib.parse.quote("OpenDTU Alert")
                 body = urllib.parse.quote(message)
                 subsystem = notifier.lower()
-                notification_url = f"http://127.0.0.1/json.htm?type=command&param=sendnotification&subject={subject}&body={body}&subsystem={subsystem}"
+                notification_url = f"http://127.0.0.1:{_domoticz_port}/json.htm?type=command&param=sendnotification&subject={subject}&body={body}&subsystem={subsystem}"
                 response = requests.get(notification_url, timeout=5)
                 response.raise_for_status()
                 Domoticz.Debug(f"Notification sent successfully via {notifier}")
@@ -365,7 +386,7 @@ def onHeartbeat():
 
 # Room Plan Management Functions
 def domoticz_api_call(params, is_utility_call=False):
-    url = "http://127.0.0.1/json.htm"
+    url = f"http://127.0.0.1:{_domoticz_port}/json.htm"
     try:
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
@@ -446,7 +467,11 @@ def add_device_to_plan(device_idx, plan_idx):
 def DumpConfigToLog():
     for x in Parameters:
         if Parameters[x] != "":
-            Domoticz.Debug(f"'{x}':'{str(Parameters[x])}'")
+            if x == "Password":  # Don't log API token
+                Domoticz.Debug("'" + x + "':'***HIDDEN***'")
+            else:
+                Domoticz.Debug(f"'{x}':'{str(Parameters[x])}'")
+
     Domoticz.Debug("Device count: " + str(len(Devices)))
     for x in Devices:
         Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
