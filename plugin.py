@@ -59,11 +59,11 @@
 """
 
 import Domoticz
+import json
 import requests
 import secrets
 import base64
 import urllib.parse
-import time
 
 GLOBAL_DEVICE_ID = "OpenDTU_Global"
 GLOBAL_DEVICE_NAME = "Solar Counter"
@@ -81,9 +81,115 @@ def get_domoticz_http_port():
     return None
 
 
+class RoomPlanManager:
+    def __init__(self):
+        self.conn = None
+        self.plan_name = ""
+        self.state = "IDLE"
+        self.plan_idx = None
+        self.plan_device_set = set()
+        self.pending_add = []
+
+    def start(self, plan_name, port, created_device_idxs):
+        self.plan_name = plan_name
+        self.pending_add = [str(x) for x in created_device_idxs if x is not None]
+        if not self.pending_add or not self.plan_name or not port:
+            return
+        self.conn = Domoticz.Connection(
+            Name="DomoticzPlanHTTP", Transport="TCP/IP", Protocol="HTTP",
+            Address="127.0.0.1", Port=str(port)
+        )
+        self.state = "GET_PLANS"
+        self.conn.Connect()
+
+    def on_connect(self, status, description):
+        if status != 0:
+            Domoticz.Error(f"PlanHTTP connect failed: {description}")
+            self.state = "ERROR"
+            return
+        self._send_next()
+
+    def on_message(self, data):
+        try:
+            raw = data.get("Data", b"") if isinstance(data, dict) else data
+            obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        except Exception as e:
+            Domoticz.Error(f"PlanHTTP invalid JSON: {e}")
+            self.state = "ERROR"
+            return
+        self._handle_response(obj)
+        self._send_next()
+
+    def _send_api(self, params):
+        qs = urllib.parse.urlencode(params)
+        self.conn.Send({"Verb": "GET", "URL": f"/json.htm?{qs}",
+                        "Headers": {"Host": "127.0.0.1", "Accept": "application/json",
+                                    "Connection": "keep-alive"}})
+
+    def _send_next(self):
+        if self.state in ("IDLE", "DONE", "ERROR"):
+            return
+        if self.state == "GET_PLANS" or self.state == "GET_PLANS_AFTER_CREATE":
+            self._send_api({"type": "command", "param": "getplans", "order": "name", "used": "true"})
+        elif self.state == "ADD_PLAN":
+            self._send_api({"type": "command", "param": "addplan", "name": self.plan_name})
+        elif self.state == "GET_PLAN_DEVICES":
+            self._send_api({"type": "command", "param": "getplandevices", "idx": int(self.plan_idx)})
+        elif self.state == "ADD_DEVICE_NEXT":
+            self._add_next_device()
+
+    def _add_next_device(self):
+        while self.pending_add:
+            dev_idx = self.pending_add.pop(0)
+            if dev_idx in self.plan_device_set:
+                Domoticz.Debug(f"Device IDX {dev_idx} already in plan - skipping")
+                continue
+            Domoticz.Log(f"Adding device IDX {dev_idx} to plan IDX {self.plan_idx}...")
+            self._send_api({"type": "command", "param": "addplanactivedevice",
+                            "activeidx": int(dev_idx), "activetype": 0, "idx": int(self.plan_idx)})
+            return
+        self.state = "DONE"
+        Domoticz.Log(f"Room plan '{self.plan_name}' sync complete.")
+
+    def _handle_response(self, obj):
+        if obj.get("status") != "OK" and self.state != "GET_PLAN_DEVICES":
+            Domoticz.Error(f"PlanHTTP API error in state {self.state}: {obj}")
+            self.state = "ERROR"
+            return
+        if self.state in ("GET_PLANS", "GET_PLANS_AFTER_CREATE"):
+            found = None
+            for p in obj.get("result", []) or []:
+                if p.get("Name") == self.plan_name:
+                    found = p.get("idx")
+                    break
+            if found:
+                Domoticz.Log(f"Found room plan '{self.plan_name}' with IDX: {found}")
+                self.plan_idx = found
+                self.state = "GET_PLAN_DEVICES"
+            elif self.state == "GET_PLANS":
+                Domoticz.Log(f"Room plan '{self.plan_name}' not found. Creating it...")
+                self.state = "ADD_PLAN"
+            else:
+                Domoticz.Error(f"Created plan '{self.plan_name}' but failed to find its IDX.")
+                self.state = "ERROR"
+        elif self.state == "ADD_PLAN":
+            Domoticz.Log(f"Room plan '{self.plan_name}' created. Re-fetching IDX...")
+            self.state = "GET_PLANS_AFTER_CREATE"
+        elif self.state == "GET_PLAN_DEVICES":
+            self.plan_device_set = set()
+            for d in obj.get("result", []) or []:
+                devidx = d.get("devidx")
+                if devidx is not None:
+                    self.plan_device_set.add(str(devidx))
+            self.state = "ADD_DEVICE_NEXT"
+        elif self.state == "ADD_DEVICE_NEXT":
+            pass
+
+
 class BasePlugin:
     def __init__(self):
         self.websocketConn = None
+        self.planMgr = RoomPlanManager()
         self.inverter_states = {}
         self.notif_all_started = False
         self.notif_all_stopped = True
@@ -113,7 +219,6 @@ class BasePlugin:
         dtu_auth_url = f"http://{Parameters['Username']}:{Parameters['Password']}@{Parameters['Address']}"
         try:
             room_plan_name = Parameters.get("Mode4", "Solar").strip() or "Solar"
-            solar_plan_idx = get_room_plan_idx(room_plan_name) if _domoticz_port else None
 
             inverters_list_response = requests.get(f'{dtu_auth_url}/api/inverter/list', timeout=5)
             inverters_list_response.raise_for_status()
@@ -144,12 +249,9 @@ class BasePlugin:
                 Domoticz.Device(Name=PROD_SWITCH_NAME, Unit=2, TypeName="On/Off", Switchtype=0, Image=32, DeviceID="OpenDTU_Prod_Switch", Used=1).Create()
                 created_devices.append(2)
 
-            if solar_plan_idx and created_devices:
-                time.sleep(2)
-                for unit_id in created_devices:
-                    if unit_id in Devices:
-                        device_idx = Devices[unit_id].ID
-                        add_device_to_plan(device_idx, solar_plan_idx)
+            if _domoticz_port and created_devices:
+                created_device_idxs = [Devices[u].ID for u in created_devices if u in Devices]
+                self.planMgr.start(room_plan_name, _domoticz_port, created_device_idxs)
 
         except requests.exceptions.RequestException as e:
             Domoticz.Error(f"Could not connect to OpenDTU at '{Parameters['Address']}'. Check IP, credentials, and network. Error: {e}")
@@ -181,6 +283,9 @@ class BasePlugin:
         self.websocketConn.Connect()
 
     def onConnect(self, Connection, Status, Description):
+        if Connection.Name == "DomoticzPlanHTTP":
+            self.planMgr.on_connect(Status, Description)
+            return
         if Status == 0:
             Domoticz.Log(f"Connected to OpenDTU at {Connection.Address}:{Connection.Port}")
             send_data = {
@@ -196,6 +301,9 @@ class BasePlugin:
             Domoticz.Error(f"Failed to connect ({Status}) to OpenDTU: {Description}")
 
     def onMessage(self, Connection, Data):
+        if Connection.Name == "DomoticzPlanHTTP":
+            self.planMgr.on_message(Data)
+            return
         if "Status" in Data:
             if Data["Status"] == "101":
                 Domoticz.Log("WebSocket connection established to /livedata")
@@ -216,7 +324,6 @@ class BasePlugin:
             return
 
         try:
-            import json
             payload = json.loads(Data["Payload"])
             self.processLiveData(payload)
         except Exception as e:
@@ -383,85 +490,6 @@ def onHeartbeat():
     global _plugin
     _plugin.onHeartbeat()
 
-
-# Room Plan Management Functions
-def domoticz_api_call(params, is_utility_call=False):
-    url = f"http://127.0.0.1:{_domoticz_port}/json.htm"
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("status") == "OK":
-            if not is_utility_call:
-                action_title = params.get("param", "Unknown Action")
-                name_param_value = params.get('sensorname', params.get('name', "Unknown Device"))
-
-                if action_title == "addplanactivedevice":
-                    Domoticz.Log(f"API call '{action_title}' successful for device IDX {params.get('activeidx')} to plan IDX {params.get('idx')}.")
-                elif action_title == "addplan":
-                    Domoticz.Log(f"API call '{action_title}' for plan '{params.get('name')}' successful. API Title: {data.get('title')}")
-                elif action_title == "setused":
-                    Domoticz.Log(f"API call '{action_title}' for device IDX {params.get('idx')} ('{name_param_value}') successful. API Title: {data.get('title')}")
-                else:
-                    new_idx = data.get("idx")
-                    Domoticz.Log(f"Device '{name_param_value}' action successful (IDX: {new_idx if new_idx else 'N/A'}). API Title: {data.get('title')}")
-            return data
-        else:
-            Domoticz.Error(f"Domoticz API error for params {params}: {data.get('message', 'Unknown error')}. Full response: {data}")
-            return None
-    except requests.exceptions.RequestException as e:
-        Domoticz.Error(f"Request failed for params {params}: {e}")
-        return None
-    except Exception as e:
-        Domoticz.Error(f"Failed to decode JSON for params {params}: {e}. Response: {response.text if 'response' in locals() else 'N/A'}")
-        return None
-
-def find_plan_idx_in_response(plan_name, data):
-    if data and data.get("status") == "OK" and "result" in data:
-        for plan in data["result"]:
-            if plan.get("Name") == plan_name:
-                plan_idx = plan.get("idx")
-                Domoticz.Log(f"Found room plan '{plan_name}' with IDX: {plan_idx}")
-                return plan_idx
-    return None
-
-def get_room_plan_idx(plan_name):
-    Domoticz.Log(f"Finding room plan IDX for '{plan_name}'...")
-    params_getplans = {"type": "command", "param": "getplans", "order": "name", "used": "true"}
-    data = domoticz_api_call(params_getplans, is_utility_call=True)
-    found_idx = find_plan_idx_in_response(plan_name, data)
-    if found_idx:
-        return found_idx
-    else:
-        Domoticz.Log(f"Room plan '{plan_name}' not found. Creating it...")
-        params_addplan = {"type": "command", "param": "addplan", "name": plan_name}
-        creation_data = domoticz_api_call(params_addplan, is_utility_call=False)
-        if creation_data and creation_data.get("status") == "OK":
-            Domoticz.Log(f"Room plan '{plan_name}' created. Re-fetching IDX...")
-            time.sleep(1)
-            data_after_create = domoticz_api_call(params_getplans, is_utility_call=True)
-            newly_created_idx = find_plan_idx_in_response(plan_name, data_after_create)
-            if newly_created_idx:
-                return newly_created_idx
-            else:
-                Domoticz.Error(f"Created plan '{plan_name}' but failed to find its IDX.")
-                return None
-        else:
-            Domoticz.Error(f"Failed to create room plan '{plan_name}'.")
-            return None
-
-def add_device_to_plan(device_idx, plan_idx):
-    Domoticz.Log(f"Adding device IDX {device_idx} to plan IDX {plan_idx}...")
-    try:
-        dev_idx_int, plan_idx_int = int(device_idx), int(plan_idx)
-    except ValueError:
-        Domoticz.Error(f"Invalid IDX for addplanactivedevice: dev='{device_idx}', plan='{plan_idx}'.")
-        return
-    params = {"type": "command", "param": "addplanactivedevice", "activeidx": dev_idx_int, "activetype": 0, "idx": plan_idx_int}
-    result = domoticz_api_call(params, is_utility_call=False)
-    if not (result and result.get("status") == "OK"):
-        Domoticz.Error(f"Failed to add device IDX {device_idx} to plan IDX {plan_idx}.")
 
 # Generic helper functions
 def DumpConfigToLog():
