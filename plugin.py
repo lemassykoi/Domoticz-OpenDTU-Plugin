@@ -3,7 +3,7 @@
 # Author: lemassykoi
 #
 """
-<plugin key="OpenDTU" name="OpenDTU Data Collector" author="lemassykoi" version="0.7.0" externallink="https://github.com/lemassykoi/Domoticz-OpenDTU-Plugin">
+<plugin key="OpenDTU" name="OpenDTU Data Collector" author="lemassykoi" version="0.8.0" externallink="https://github.com/lemassykoi/Domoticz-OpenDTU-Plugin">
     <description>
         <h2>OpenDTU Data Collector</h2><br/>
         Collects solar data from an OpenDTU unit via WebSocket. The plugin automatically discovers inverters and creates corresponding devices in Domoticz.
@@ -58,9 +58,8 @@
 </plugin>
 """
 
-import Domoticz
+import Domoticz  # type: ignore
 import json
-import requests
 import secrets
 import base64
 import urllib.parse
@@ -186,10 +185,89 @@ class RoomPlanManager:
             pass
 
 
+class NotificationManager:
+    def __init__(self):
+        self.conn = None
+        self.port = None
+        self.queue = []
+        self.sending = False
+
+    def configure(self, port):
+        self.port = port
+
+    def send(self, message, notifier):
+        if not self.port or not notifier:
+            Domoticz.Debug(f"Notification suppressed (notifier not configured): '{message}'")
+            return
+        Domoticz.Log(f"Sending notification: '{message}' via '{notifier}'")
+        self.queue.append((message, notifier))
+        self._process_queue()
+
+    def _process_queue(self):
+        if self.sending or not self.queue:
+            return
+        if self.conn is None:
+            self.conn = Domoticz.Connection(
+                Name="DomoticzNotifHTTP", Transport="TCP/IP", Protocol="HTTP",
+                Address="127.0.0.1", Port=str(self.port)
+            )
+        if not self.conn.Connected() and not self.conn.Connecting():
+            self.conn.Connect()
+            return
+        self._send_next()
+
+    def _send_next(self):
+        if not self.queue:
+            self.sending = False
+            return
+        message, notifier = self.queue.pop(0)
+        self.sending = True
+        qs = urllib.parse.urlencode({
+            "type": "command",
+            "param": "sendnotification",
+            "subject": "OpenDTU Alert",
+            "body": message,
+            "subsystem": notifier.lower()
+        })
+        self.conn.Send({
+            "Verb": "GET", "URL": f"/json.htm?{qs}",
+            "Headers": {"Host": "127.0.0.1", "Accept": "application/json",
+                        "Connection": "keep-alive"}
+        })
+
+    def on_connect(self, status, description):
+        if status != 0:
+            Domoticz.Error(f"NotifHTTP connect failed: {description}")
+            self.sending = False
+            self.queue.clear()
+            return
+        self._send_next()
+
+    def on_message(self, data):
+        try:
+            raw = data.get("Data", b"") if isinstance(data, dict) else data
+            obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            if obj.get("status") == "OK":
+                Domoticz.Debug("Notification sent successfully")
+            else:
+                Domoticz.Error(f"Notification API error: {obj}")
+        except Exception as e:
+            Domoticz.Error(f"NotifHTTP invalid JSON: {e}")
+        self.sending = False
+        self._process_queue()
+
+    def on_disconnect(self):
+        self.sending = False
+        if self.queue:
+            self._process_queue()
+
+
 class BasePlugin:
     def __init__(self):
         self.websocketConn = None
+        self.discoveryConn = None
         self.planMgr = RoomPlanManager()
+        self.notifMgr = NotificationManager()
         self.inverter_states = {}
         self.notif_all_started = False
         self.notif_all_stopped = True
@@ -198,6 +276,7 @@ class BasePlugin:
         self.last_global_svalue = ""
         self.last_total_yield = 0
         self.yield_offset = 0
+        self.room_plan_name = "Solar"
         return
 
     def onStart(self):
@@ -215,50 +294,9 @@ class BasePlugin:
         else:
             Domoticz.Error("Failed to detect Domoticz HTTP Port")
 
-        # --- Device Discovery and Creation (one-time HTTP call) ---
-        dtu_auth_url = f"http://{Parameters['Username']}:{Parameters['Password']}@{Parameters['Address']}"
-        try:
-            room_plan_name = Parameters.get("Mode4", "Solar").strip() or "Solar"
+        self.notifMgr.configure(_domoticz_port)
+        self.room_plan_name = Parameters.get("Mode4", "Solar").strip() or "Solar"
 
-            inverters_list_response = requests.get(f'{dtu_auth_url}/api/inverter/list', timeout=5)
-            inverters_list_response.raise_for_status()
-            inverters_data = inverters_list_response.json()
-
-            created_devices = []
-            unit_id_counter = 3
-            for inverter in inverters_data['inverter']:
-                name = inverter['name']
-                serial = inverter['serial']
-                Domoticz.Log(f"Discovered Inverter: {name} (Serial: {serial})")
-
-                self.inverter_states[serial] = {'producing': False, 'name': name, 'unit': unit_id_counter}
-
-                if unit_id_counter not in Devices:
-                    Domoticz.Log(f"Creating device for inverter '{name}' with Unit={unit_id_counter}, DeviceID='{serial}'")
-                    Domoticz.Device(Name=name, Unit=unit_id_counter, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=str(serial), Used=1, Options={'EnergyMeterMode': '1'}).Create()
-                    created_devices.append(unit_id_counter)
-                unit_id_counter += 1
-
-            if 1 not in Devices:
-                Domoticz.Log(f"Creating global device with Unit=1, DeviceID='{GLOBAL_DEVICE_ID}'")
-                Domoticz.Device(Name=GLOBAL_DEVICE_NAME, Unit=1, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=GLOBAL_DEVICE_ID, Used=1, Options={'EnergyMeterMode': '1'}).Create()
-                created_devices.append(1)
-
-            if 2 not in Devices:
-                Domoticz.Log(f"Creating production switch with Unit=2, DeviceID='OpenDTU_Prod_Switch'")
-                Domoticz.Device(Name=PROD_SWITCH_NAME, Unit=2, TypeName="On/Off", Switchtype=0, Image=32, DeviceID="OpenDTU_Prod_Switch", Used=1).Create()
-                created_devices.append(2)
-
-            if _domoticz_port and created_devices:
-                created_device_idxs = [Devices[u].ID for u in created_devices if u in Devices]
-                self.planMgr.start(room_plan_name, _domoticz_port, created_device_idxs)
-
-        except requests.exceptions.RequestException as e:
-            Domoticz.Error(f"Could not connect to OpenDTU at '{Parameters['Address']}'. Check IP, credentials, and network. Error: {e}")
-        except Exception as e:
-            Domoticz.Error(f"An unexpected error occurred during onStart: {e}")
-
-        # --- Restore last known total yield from existing device ---
         if 1 in Devices and Devices[1].sValue:
             try:
                 parts = Devices[1].sValue.split(";")
@@ -268,7 +306,56 @@ class BasePlugin:
             except (ValueError, IndexError):
                 pass
 
-        # --- Connect WebSocket ---
+        self.discoveryConn = Domoticz.Connection(
+            Name="OpenDTUDiscovery", Transport="TCP/IP", Protocol="HTTP",
+            Address=Parameters["Address"], Port="80"
+        )
+        self.discoveryConn.Connect()
+
+    def _handleDiscoveryResponse(self, data):
+        status_code = int(data.get("Status", "0"))
+        if status_code != 200:
+            Domoticz.Error(f"OpenDTU discovery failed with HTTP {status_code}")
+            self.connectWebSocket()
+            return
+
+        try:
+            raw = data.get("Data", b"")
+            inverters_data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        except Exception as e:
+            Domoticz.Error(f"Failed to parse inverter list: {e}")
+            self.connectWebSocket()
+            return
+
+        created_devices = []
+        unit_id_counter = 3
+        for inverter in inverters_data.get('inverter', []):
+            name = inverter['name']
+            serial = inverter['serial']
+            Domoticz.Log(f"Discovered Inverter: {name} (Serial: {serial})")
+
+            self.inverter_states[serial] = {'producing': False, 'name': name, 'unit': unit_id_counter}
+
+            if unit_id_counter not in Devices:
+                Domoticz.Log(f"Creating device for inverter '{name}' with Unit={unit_id_counter}, DeviceID='{serial}'")
+                Domoticz.Device(Name=name, Unit=unit_id_counter, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=str(serial), Used=1, Options={'EnergyMeterMode': '1'}).Create()
+                created_devices.append(unit_id_counter)
+            unit_id_counter += 1
+
+        if 1 not in Devices:
+            Domoticz.Log(f"Creating global device with Unit=1, DeviceID='{GLOBAL_DEVICE_ID}'")
+            Domoticz.Device(Name=GLOBAL_DEVICE_NAME, Unit=1, TypeName="kWh", Subtype=29, Switchtype=4, DeviceID=GLOBAL_DEVICE_ID, Used=1, Options={'EnergyMeterMode': '1'}).Create()
+            created_devices.append(1)
+
+        if 2 not in Devices:
+            Domoticz.Log(f"Creating production switch with Unit=2, DeviceID='OpenDTU_Prod_Switch'")
+            Domoticz.Device(Name=PROD_SWITCH_NAME, Unit=2, TypeName="On/Off", Switchtype=0, Image=32, DeviceID="OpenDTU_Prod_Switch", Used=1).Create()
+            created_devices.append(2)
+
+        if _domoticz_port and created_devices:
+            created_device_idxs = [Devices[u].ID for u in created_devices if u in Devices]
+            self.planMgr.start(self.room_plan_name, _domoticz_port, created_device_idxs)
+
         self.connectWebSocket()
 
     def connectWebSocket(self):
@@ -286,48 +373,75 @@ class BasePlugin:
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_connect(Status, Description)
             return
-        if Status == 0:
-            Domoticz.Log(f"Connected to OpenDTU at {Connection.Address}:{Connection.Port}")
-            send_data = {
-                'URL': '/livedata',
-                'Headers': {
-                    'Host': Parameters["Address"],
-                    'Origin': 'http://' + Parameters["Address"],
-                    'Sec-WebSocket-Key': base64.b64encode(secrets.token_bytes(16)).decode("utf-8")
-                }
-            }
-            Connection.Send(send_data)
-        else:
-            Domoticz.Error(f"Failed to connect ({Status}) to OpenDTU: {Description}")
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_connect(Status, Description)
+            return
+        if Connection.Name == "OpenDTUDiscovery":
+            if Status == 0:
+                auth_string = f"{Parameters['Username']}:{Parameters['Password']}"
+                auth_b64 = base64.b64encode(auth_string.encode()).decode()
+                Connection.Send({
+                    "Verb": "GET", "URL": "/api/inverter/list",
+                    "Headers": {
+                        "Host": Parameters["Address"],
+                        "Authorization": f"Basic {auth_b64}",
+                        "Accept": "application/json",
+                        "Connection": "close"
+                    }
+                })
+            else:
+                Domoticz.Error(f"Failed to connect to OpenDTU for discovery: {Description}")
+                self.connectWebSocket()
+            return
+        if Connection.Name == "OpenDTUWebSocket":
+            if Status == 0:
+                Domoticz.Log(f"Connected to OpenDTU at {Connection.Address}:{Connection.Port}")
+                Connection.Send({
+                    'URL': '/livedata',
+                    'Headers': {
+                        'Host': Parameters["Address"],
+                        'Origin': 'http://' + Parameters["Address"],
+                        'Sec-WebSocket-Key': base64.b64encode(secrets.token_bytes(16)).decode("utf-8")
+                    }
+                })
+            else:
+                Domoticz.Error(f"Failed to connect ({Status}) to OpenDTU: {Description}")
 
     def onMessage(self, Connection, Data):
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_message(Data)
             return
-        if "Status" in Data:
-            if Data["Status"] == "101":
-                Domoticz.Log("WebSocket connection established to /livedata")
-            else:
-                Domoticz.Error(f"WebSocket upgrade failed with status {Data['Status']}")
-                DumpWSResponseToLog(Data)
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_message(Data)
             return
-
-        if "Operation" in Data:
-            if Data["Operation"] == "Ping":
-                Domoticz.Debug("Ping received, sending Pong")
-                Connection.Send({'Operation': 'Pong', 'Payload': 'Pong', 'Mask': secrets.randbits(32)})
-            elif Data["Operation"] == "Close":
-                Domoticz.Log("WebSocket Close received from OpenDTU")
+        if Connection.Name == "OpenDTUDiscovery":
+            self._handleDiscoveryResponse(Data)
             return
+        if Connection.Name == "OpenDTUWebSocket":
+            if "Status" in Data:
+                if Data["Status"] == "101":
+                    Domoticz.Log("WebSocket connection established to /livedata")
+                else:
+                    Domoticz.Error(f"WebSocket upgrade failed with status {Data['Status']}")
+                    DumpWSResponseToLog(Data)
+                return
 
-        if "Payload" not in Data:
-            return
+            if "Operation" in Data:
+                if Data["Operation"] == "Ping":
+                    Domoticz.Debug("Ping received, sending Pong")
+                    Connection.Send({'Operation': 'Pong', 'Payload': 'Pong', 'Mask': secrets.randbits(32)})
+                elif Data["Operation"] == "Close":
+                    Domoticz.Log("WebSocket Close received from OpenDTU")
+                return
 
-        try:
-            payload = json.loads(Data["Payload"])
-            self.processLiveData(payload)
-        except Exception as e:
-            Domoticz.Error(f"Error processing WebSocket message: {e}")
+            if "Payload" not in Data:
+                return
+
+            try:
+                payload = json.loads(Data["Payload"])
+                self.processLiveData(payload)
+            except Exception as e:
+                Domoticz.Error(f"Error processing WebSocket message: {e}")
 
     def processLiveData(self, live_data):
         if 'inverters' not in live_data or len(live_data['inverters']) == 0:
@@ -336,7 +450,6 @@ class BasePlugin:
         inverter_data = live_data['inverters'][0]
         serial = inverter_data['serial']
 
-        # --- Update Global Device (only if value changed) ---
         if 'total' in live_data and 1 in Devices:
             total_power = float(live_data['total']['Power']['v'])
             raw_yield = int(float(live_data['total']['YieldTotal']['v']) * 1000)
@@ -356,7 +469,6 @@ class BasePlugin:
                 self.last_global_svalue = sValue
                 Domoticz.Debug(f"Global device updated: {sValue}")
 
-        # --- Update Individual Inverter Device ---
         if serial not in self.inverter_states:
             Domoticz.Debug(f"Received data for unknown inverter {serial}, ignoring")
             return
@@ -374,25 +486,23 @@ class BasePlugin:
             except (KeyError, TypeError) as e:
                 Domoticz.Error(f"Missing data fields for inverter {inverter_name}: {e}")
 
-        # --- Production State Notifications ---
         current_producing = inverter_data.get('producing', False)
         was_producing = self.inverter_states[serial]['producing']
 
         if current_producing and not was_producing:
             if Parameters["Mode3"] != "0":
-                self.send_notification(f"☀️ Solar production started for {inverter_name}")
+                self.notifMgr.send(f"☀️ Solar production started for {inverter_name}", Parameters["Mode2"])
             self.inverter_states[serial]['producing'] = True
         elif not current_producing and was_producing:
             if Parameters["Mode3"] != "0":
-                self.send_notification(f"🌙 Solar production stopped for {inverter_name}")
+                self.notifMgr.send(f"🌙 Solar production stopped for {inverter_name}", Parameters["Mode2"])
             self.inverter_states[serial]['producing'] = False
 
-        # --- Overall Production State ---
         all_producing = all(state['producing'] for state in self.inverter_states.values())
         none_producing = not any(state['producing'] for state in self.inverter_states.values())
 
         if all_producing and not self.notif_all_started:
-            self.send_notification("🔆 All inverters are now producing!")
+            self.notifMgr.send("🔆 All inverters are now producing!", Parameters["Mode2"])
             if 2 in Devices:
                 Devices[2].Update(nValue=1, sValue="On")
             self.notif_all_started = True
@@ -400,7 +510,7 @@ class BasePlugin:
             self.daily_report_sent = False
 
         elif none_producing and not self.notif_all_stopped:
-            self.send_notification("🌜 All inverters have stopped production.")
+            self.notifMgr.send("🌜 All inverters have stopped production.", Parameters["Mode2"])
             if 2 in Devices:
                 Devices[2].Update(nValue=0, sValue="Off")
             self.notif_all_stopped = True
@@ -409,26 +519,8 @@ class BasePlugin:
             if not self.daily_report_sent and 'total' in live_data:
                 daily_yield = float(live_data['total']['YieldDay']['v'])
                 energy_in_kwh = daily_yield / 1000
-                message = f"🌞 Production Solaire du Jour : {energy_in_kwh:.3f} kWh"
-                self.send_notification(message)
+                self.notifMgr.send(f"🌞 Production Solaire du Jour : {energy_in_kwh:.3f} kWh", Parameters["Mode2"])
                 self.daily_report_sent = True
-
-    def send_notification(self, message):
-        notifier = Parameters["Mode2"]
-        if notifier and _domoticz_port:
-            Domoticz.Log(f"Sending notification: '{message}' via '{notifier}'")
-            try:
-                subject = urllib.parse.quote("OpenDTU Alert")
-                body = urllib.parse.quote(message)
-                subsystem = notifier.lower()
-                notification_url = f"http://127.0.0.1:{_domoticz_port}/json.htm?type=command&param=sendnotification&subject={subject}&body={body}&subsystem={subsystem}"
-                response = requests.get(notification_url, timeout=5)
-                response.raise_for_status()
-                Domoticz.Debug(f"Notification sent successfully via {notifier}")
-            except Exception as e:
-                Domoticz.Error(f"Failed to send notification: {e}")
-        else:
-            Domoticz.Debug(f"Notification suppressed (notifier not configured): '{message}'")
 
     def onHeartbeat(self):
         if self.websocketConn and self.websocketConn.Connected():
@@ -445,6 +537,13 @@ class BasePlugin:
                 Domoticz.Log(f"WebSocket disconnected, retrying in {self.reconAgain} heartbeats")
 
     def onDisconnect(self, Connection):
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_disconnect()
+            return
+        if Connection.Name == "OpenDTUDiscovery":
+            return
+        if Connection.Name == "DomoticzPlanHTTP":
+            return
         Domoticz.Log("WebSocket disconnected from OpenDTU")
 
     def onCommand(self, Unit, Command, Level, Hue):
@@ -495,19 +594,18 @@ def onHeartbeat():
 def DumpConfigToLog():
     for x in Parameters:
         if Parameters[x] != "":
-            if x == "Password":  # Don't log API token
-                Domoticz.Debug("'" + x + "':'***HIDDEN***'")
+            if x == "Password":
+                Domoticz.Debug(f"'{x}':'***HIDDEN***'")
             else:
-                Domoticz.Debug(f"'{x}':'{str(Parameters[x])}'")
-
-    Domoticz.Debug("Device count: " + str(len(Devices)))
+                Domoticz.Debug(f"'{x}':'{Parameters[x]}'")
+    Domoticz.Debug(f"Device count: {len(Devices)}")
     for x in Devices:
-        Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
-        Domoticz.Debug("Device ID:       '" + str(Devices[x].ID) + "'")
-        Domoticz.Debug("Device Name:     '" + Devices[x].Name + "'")
-        Domoticz.Debug("Device nValue:    " + str(Devices[x].nValue))
-        Domoticz.Debug("Device sValue:   '" + Devices[x].sValue + "'")
-        Domoticz.Debug("Device LastLevel: " + str(Devices[x].LastLevel))
+        Domoticz.Debug(f"Device: {x} - {Devices[x]}")
+        Domoticz.Debug(f"Device ID:       '{Devices[x].ID}'")
+        Domoticz.Debug(f"Device Name:     '{Devices[x].Name}'")
+        Domoticz.Debug(f"Device nValue:    {Devices[x].nValue}")
+        Domoticz.Debug(f"Device sValue:   '{Devices[x].sValue}'")
+        Domoticz.Debug(f"Device LastLevel: {Devices[x].LastLevel}")
 
 def DumpWSResponseToLog(httpDict):
     if isinstance(httpDict, dict):
