@@ -109,8 +109,10 @@ class RoomPlanManager:
         self._send_next()
 
     def on_message(self, data):
+        raw = data.get("Data", b"") if isinstance(data, dict) else data
+        if not raw:
+            return
         try:
-            raw = data.get("Data", b"") if isinstance(data, dict) else data
             obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
         except Exception as e:
             Domoticz.Error(f"PlanHTTP invalid JSON: {e}")
@@ -244,8 +246,10 @@ class NotificationManager:
         self._send_next()
 
     def on_message(self, data):
+        raw = data.get("Data", b"") if isinstance(data, dict) else data
+        if not raw:
+            return
         try:
-            raw = data.get("Data", b"") if isinstance(data, dict) else data
             obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
             if obj.get("status") == "OK":
                 Domoticz.Debug("Notification sent successfully")
@@ -510,17 +514,18 @@ class BasePlugin:
             self.daily_report_sent = False
 
         elif none_producing and not self.notif_all_stopped:
-            self.notifMgr.send("🌜 All inverters have stopped production.", Parameters["Mode2"])
             if 2 in Devices:
                 Devices[2].Update(nValue=0, sValue="Off")
-            self.notif_all_stopped = True
-            self.notif_all_started = False
 
+            msg = "🌜 All inverters have stopped production."
             if not self.daily_report_sent and 'total' in live_data:
                 daily_yield = float(live_data['total']['YieldDay']['v'])
                 energy_in_kwh = daily_yield / 1000
-                self.notifMgr.send(f"🌞 Production Solaire du Jour : {energy_in_kwh:.3f} kWh", Parameters["Mode2"])
+                msg += f"\n🌞 Production Solaire du Jour : {energy_in_kwh:.3f} kWh"
                 self.daily_report_sent = True
+            self.notifMgr.send(msg, Parameters["Mode2"])
+            self.notif_all_stopped = True
+            self.notif_all_started = False
 
     def onHeartbeat(self):
         if self.websocketConn and self.websocketConn.Connected():
