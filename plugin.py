@@ -208,15 +208,11 @@ class NotificationManager:
     def _process_queue(self):
         if self.sending or not self.queue:
             return
-        if self.conn is None:
-            self.conn = Domoticz.Connection(
-                Name="DomoticzNotifHTTP", Transport="TCP/IP", Protocol="HTTP",
-                Address="127.0.0.1", Port=str(self.port)
-            )
-        if not self.conn.Connected() and not self.conn.Connecting():
-            self.conn.Connect()
-            return
-        self._send_next()
+        self.conn = Domoticz.Connection(
+            Name="DomoticzNotifHTTP", Transport="TCP/IP", Protocol="HTTP",
+            Address="127.0.0.1", Port=str(self.port)
+        )
+        self.conn.Connect()
 
     def _send_next(self):
         if not self.queue:
@@ -234,7 +230,7 @@ class NotificationManager:
         self.conn.Send({
             "Verb": "GET", "URL": f"/json.htm?{qs}",
             "Headers": {"Host": "127.0.0.1", "Accept": "application/json",
-                        "Connection": "keep-alive"}
+                        "Connection": "close"}
         })
 
     def on_connect(self, status, description):
