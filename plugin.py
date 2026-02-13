@@ -109,9 +109,13 @@ class RoomPlanManager:
         self._send_next()
 
     def on_message(self, data):
-        raw = data.get("Data", b"") if isinstance(data, dict) else data
-        if not raw:
+        if not isinstance(data, dict) or "Status" not in data:
             return
+        if data["Status"] != "200":
+            Domoticz.Error(f"PlanHTTP API returned HTTP {data['Status']}")
+            self.state = "ERROR"
+            return
+        raw = data.get("Data", b"")
         try:
             obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
         except Exception as e:
@@ -242,17 +246,13 @@ class NotificationManager:
         self._send_next()
 
     def on_message(self, data):
-        raw = data.get("Data", b"") if isinstance(data, dict) else data
-        if not raw:
+        if not isinstance(data, dict) or "Status" not in data:
             return
-        try:
-            obj = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-            if obj.get("status") == "OK":
-                Domoticz.Debug("Notification sent successfully")
-            else:
-                Domoticz.Error(f"Notification API error: {obj}")
-        except Exception as e:
-            Domoticz.Error(f"NotifHTTP invalid JSON: {e}")
+        status = data["Status"]
+        if status == "200":
+            Domoticz.Debug("Notification sent successfully")
+        else:
+            Domoticz.Error(f"Notification API returned HTTP {status}")
         self.sending = False
         self._process_queue()
 
