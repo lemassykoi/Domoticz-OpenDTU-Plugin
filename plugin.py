@@ -63,7 +63,6 @@ import json
 import secrets
 import base64
 import urllib.parse
-import urllib.request
 
 GLOBAL_DEVICE_ID = "OpenDTU_Global"
 GLOBAL_DEVICE_NAME = "Solar Counter"
@@ -194,7 +193,10 @@ class RoomPlanManager:
 
 class NotificationManager:
     def __init__(self):
+        self.conn = None
         self.port = None
+        self.queue = []
+        self.sending = False
 
     def configure(self, port):
         self.port = port
@@ -204,6 +206,24 @@ class NotificationManager:
             Domoticz.Debug(f"Notification suppressed (notifier not configured): '{message}'")
             return
         Domoticz.Log(f"Sending notification: '{message}' via '{notifier}'")
+        self.queue.append((message, notifier))
+        self._process_queue()
+
+    def _process_queue(self):
+        if self.sending or not self.queue:
+            return
+        self.conn = Domoticz.Connection(
+            Name="DomoticzNotifHTTP", Transport="TCP/IP", Protocol="HTTP",
+            Address="127.0.0.1", Port=str(self.port)
+        )
+        self.conn.Connect()
+
+    def _send_next(self):
+        if not self.queue:
+            self.sending = False
+            return
+        message, notifier = self.queue.pop(0)
+        self.sending = True
         qs = urllib.parse.urlencode({
             "type": "command",
             "param": "sendnotification",
@@ -211,12 +231,35 @@ class NotificationManager:
             "body": message,
             "subsystem": notifier.lower()
         })
-        url = f"http://127.0.0.1:{self.port}/json.htm?{qs}"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                Domoticz.Debug(f"Notification sent (HTTP {resp.status})")
-        except Exception as e:
-            Domoticz.Error(f"Notification failed: {e}")
+        self.conn.Send({
+            "Verb": "GET", "URL": f"/json.htm?{qs}",
+            "Headers": {"Host": "127.0.0.1", "Accept": "application/json",
+                        "Connection": "close"}
+        })
+
+    def on_connect(self, status, description):
+        if status != 0:
+            Domoticz.Error(f"NotifHTTP connect failed: {description}")
+            self.sending = False
+            self.queue.clear()
+            return
+        self._send_next()
+
+    def on_message(self, data):
+        if not isinstance(data, dict) or "Status" not in data:
+            return
+        status = data["Status"]
+        if status == "200":
+            Domoticz.Debug("Notification sent successfully")
+        else:
+            Domoticz.Error(f"Notification API returned HTTP {status}")
+        self.sending = False
+        self._process_queue()
+
+    def on_disconnect(self):
+        self.sending = False
+        if self.queue:
+            self._process_queue()
 
 
 class BasePlugin:
@@ -330,6 +373,9 @@ class BasePlugin:
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_connect(Status, Description)
             return
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_connect(Status, Description)
+            return
         if Connection.Name == "OpenDTUDiscovery":
             if Status == 0:
                 auth_string = f"{Parameters['Username']}:{Parameters['Password']}"
@@ -364,6 +410,9 @@ class BasePlugin:
     def onMessage(self, Connection, Data):
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_message(Data)
+            return
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_message(Data)
             return
         if Connection.Name == "OpenDTUDiscovery":
             self._handleDiscoveryResponse(Data)
@@ -489,6 +538,9 @@ class BasePlugin:
                 Domoticz.Log(f"WebSocket disconnected, retrying in {self.reconAgain} heartbeats")
 
     def onDisconnect(self, Connection):
+        if Connection.Name == "DomoticzNotifHTTP":
+            self.notifMgr.on_disconnect()
+            return
         if Connection.Name == "OpenDTUDiscovery":
             return
         if Connection.Name == "DomoticzPlanHTTP":
