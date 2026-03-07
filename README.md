@@ -17,7 +17,7 @@ A Domoticz plugin that collects solar production data from an OpenDTU unit via W
 
 ## Requirements
 
-- **Domoticz** 2020.2 or later
+- **Domoticz** development build #17340+ or beta/stable with `Domoticz.SendNotification()` support (merged in [PR #6634](https://github.com/domoticz/domoticz/pull/6634)). Older builds will work but notifications will be silently skipped.
 - **OpenDTU** device accessible via HTTP/WebSocket
 - **Python 3.9+** with requests library
 - Network connectivity between Domoticz and OpenDTU

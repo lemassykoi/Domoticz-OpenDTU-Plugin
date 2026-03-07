@@ -192,74 +192,13 @@ class RoomPlanManager:
 
 
 class NotificationManager:
-    def __init__(self):
-        self.conn = None
-        self.port = None
-        self.queue = []
-        self.sending = False
-
-    def configure(self, port):
-        self.port = port
-
-    def send(self, message, notifier):
-        if not self.port or not notifier:
+    @staticmethod
+    def send(message, notifier):
+        if not notifier:
             Domoticz.Debug(f"Notification suppressed (notifier not configured): '{message}'")
             return
         Domoticz.Log(f"Sending notification: '{message}' via '{notifier}'")
-        self.queue.append((message, notifier))
-        self._process_queue()
-
-    def _process_queue(self):
-        if self.sending or not self.queue:
-            return
-        self.conn = Domoticz.Connection(
-            Name="DomoticzNotifHTTP", Transport="TCP/IP", Protocol="HTTP",
-            Address="127.0.0.1", Port=str(self.port)
-        )
-        self.conn.Connect()
-
-    def _send_next(self):
-        if not self.queue:
-            self.sending = False
-            return
-        message, notifier = self.queue.pop(0)
-        self.sending = True
-        qs = urllib.parse.urlencode({
-            "type": "command",
-            "param": "sendnotification",
-            "subject": "OpenDTU Alert",
-            "body": message,
-            "subsystem": notifier.lower()
-        })
-        self.conn.Send({
-            "Verb": "GET", "URL": f"/json.htm?{qs}",
-            "Headers": {"Host": "127.0.0.1", "Accept": "application/json",
-                        "Connection": "close"}
-        })
-
-    def on_connect(self, status, description):
-        if status != 0:
-            Domoticz.Error(f"NotifHTTP connect failed: {description}")
-            self.sending = False
-            self.queue.clear()
-            return
-        self._send_next()
-
-    def on_message(self, data):
-        if not isinstance(data, dict) or "Status" not in data:
-            return
-        status = data["Status"]
-        if status == "200":
-            Domoticz.Debug("Notification sent successfully")
-        else:
-            Domoticz.Error(f"Notification API returned HTTP {status}")
-        self.sending = False
-        self._process_queue()
-
-    def on_disconnect(self):
-        self.sending = False
-        if self.queue:
-            self._process_queue()
+        Domoticz.SendNotification(subject="OpenDTU Alert", body=message, subsystem=notifier.lower())
 
 
 class BasePlugin:
@@ -294,7 +233,6 @@ class BasePlugin:
         else:
             Domoticz.Error("Failed to detect Domoticz HTTP Port")
 
-        self.notifMgr.configure(_domoticz_port)
         self.room_plan_name = Parameters.get("Mode4", "Solar").strip() or "Solar"
 
         if 1 in Devices and Devices[1].sValue:
@@ -373,9 +311,6 @@ class BasePlugin:
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_connect(Status, Description)
             return
-        if Connection.Name == "DomoticzNotifHTTP":
-            self.notifMgr.on_connect(Status, Description)
-            return
         if Connection.Name == "OpenDTUDiscovery":
             if Status == 0:
                 auth_string = f"{Parameters['Username']}:{Parameters['Password']}"
@@ -410,9 +345,6 @@ class BasePlugin:
     def onMessage(self, Connection, Data):
         if Connection.Name == "DomoticzPlanHTTP":
             self.planMgr.on_message(Data)
-            return
-        if Connection.Name == "DomoticzNotifHTTP":
-            self.notifMgr.on_message(Data)
             return
         if Connection.Name == "OpenDTUDiscovery":
             self._handleDiscoveryResponse(Data)
@@ -538,9 +470,6 @@ class BasePlugin:
                 Domoticz.Log(f"WebSocket disconnected, retrying in {self.reconAgain} heartbeats")
 
     def onDisconnect(self, Connection):
-        if Connection.Name == "DomoticzNotifHTTP":
-            self.notifMgr.on_disconnect()
-            return
         if Connection.Name == "OpenDTUDiscovery":
             return
         if Connection.Name == "DomoticzPlanHTTP":
